@@ -1,0 +1,19 @@
+# Ray配置文件 - 完全使用内存存储
+ray:
+  object_store:
+    memory: 4000000000  # 4GB内存存储
+    allow_slow_storage: false  # 禁用慢速存储
+    spilling: false  # 禁用溢出
+    spilling_threshold: 0  # 溢出阈值为0
+  system:
+    temp_dir: "/tmp/ray_memory_only"
+  logging:
+    level: "warning"  # 减少日志输出
+  task:
+    max_retries: 1
+  runtime_env:
+    disable: true
+  plasma:
+    memory: 4000000000
+    object_store_memory: 4000000000
+    spilling: false 
