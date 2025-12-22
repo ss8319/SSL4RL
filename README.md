@@ -33,6 +33,10 @@ Wei Lin,
 
 We propose ***SSL4RL***, a novel framework that leverages self-supervised learning (SSL) tasks as a source of verifiable rewards for RL-based fine-tuning. Our approach reformulates SSL objectives—such as predicting image rotation or reconstructing masked patches—into dense, automatic reward signals, eliminating the need for human preference data or unreliable AI evaluators. Experiments show that SSL4RL substantially improves performance on both **vision-centric** and **vision-language reasoning benchmarks**, with encouraging potentials on **open-ended image-captioning tasks**. Through systematic ablations, we identify key factors—such as **data volume, model scale, model choice, task difficulty, and semantic alignment with the target domain** — that influence the effectiveness of SSL4RL tasks, offering new design principles for future work. We also demonstrate the framework’s generality by applying it to graph learning, where it yields significant gains. SSL4RL establishes a versatile and effective paradigm for aligning multimodal models using verifiable, self-supervised objectives.
 
+<p align="center">
+  <img src="SSL4RL-Overview.png" alt="SSL4RL Overview" width="1000">
+</p>
+
 ## 📌 Key Takeaways
 
 1️⃣ **SSL as Intrinsic Reward Sharpens VLM Reasoning**. The SSL4RL paradigm demonstrably enhances vision-language reasoning by repurposing SSL tasks as intrinsic rewards. It deepens the perception and understanding of the image itself, leading towards more precise visual attention and less language bias.
