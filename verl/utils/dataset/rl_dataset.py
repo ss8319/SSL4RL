@@ -107,9 +107,17 @@ class RLHFDataset(Dataset):
         self.return_full_prompt = config.get("return_full_prompt", False)
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
+        # If the dataset contains multimodal columns (images/videos), we should not silently
+        # proceed without a processor: that would effectively train "text-only" (or crash later).
+        # Set to False to allow text-only datasets that still carry unused image/video columns.
+        self.require_processor_for_multimodal = bool(config.get("require_processor_for_multimodal", True))
 
-        self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
-        self.num_workers = min(self.num_workers, os.cpu_count())
+        # NOTE: HuggingFace Datasets uses multiprocessing whenever num_proc is set,
+        # even when num_proc=1. In Ray workers this can deadlock (fork safety / IPC),
+        # so treat <=1 as "single-process" and avoid passing num_proc downstream.
+        self.num_workers = int(config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4)))
+        self.num_workers = max(0, self.num_workers)
+        self.num_workers = min(self.num_workers, os.cpu_count() or 1)
         self.use_shm = config.get("use_shm", False)
         self.chat_template_func = config.get("chat_template_func", None)
         self.need_tools_kwargs = config.get("need_tools_kwargs", False)
@@ -119,6 +127,33 @@ class RLHFDataset(Dataset):
 
         self._download()
         self._read_files_and_tokenize()
+
+    def _dataset_uses_multimodal_inputs(self, dataframe: datasets.Dataset) -> bool:
+        """Best-effort check whether dataset actually contains images/videos.
+
+        We avoid scanning the full dataset (could be large) and instead sample
+        a small number of rows.
+        """
+        column_names = set(getattr(dataframe, "column_names", []) or [])
+        maybe_keys = []
+        if self.image_key in column_names:
+            maybe_keys.append(self.image_key)
+        if self.video_key in column_names:
+            maybe_keys.append(self.video_key)
+        if not maybe_keys:
+            return False
+
+        sample_n = min(len(dataframe), 32)
+        for i in range(sample_n):
+            row = dataframe[i]
+            for k in maybe_keys:
+                v = row.get(k, None)
+                if v is None:
+                    continue
+                # Most of our parquet rows store images/videos as list-like.
+                if isinstance(v, (list, tuple, np.ndarray)) and len(v) > 0:
+                    return True
+        return False
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
@@ -136,6 +171,15 @@ class RLHFDataset(Dataset):
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
         print(f"dataset len: {len(self.dataframe)}")
+
+        if self.processor is None and self.require_processor_for_multimodal:
+            if self._dataset_uses_multimodal_inputs(self.dataframe):
+                raise RuntimeError(
+                    "Dataset contains images/videos but HuggingFace processor is None. "
+                    "This would result in incorrect (effectively text-only) training or token-length stats. "
+                    "Fix processor loading (e.g., set HF_TOKEN / ensure model+processor available offline), "
+                    "or set data.require_processor_for_multimodal=false to override."
+                )
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 
@@ -159,11 +203,25 @@ class RLHFDataset(Dataset):
                     images = [process_image(image) for image in doc[image_key]] if image_key in doc else None
                     videos = [process_video(video) for video in doc[video_key]] if video_key in doc else None
 
-                    return len(processor(text=[raw_prompt], images=images, videos=videos)["input_ids"][0])
+                    # Force pixel limits for Qwen2/3-VL during length calculation if not already set
+                    # This prevents extreme token counts during initialization
+                    proc_kwargs = {}
+                    image_processor_name = getattr(getattr(processor, "image_processor", None), "__class__", type("X", (), {})).__name__
+                    if "Qwen2VLImageProcessor" in image_processor_name or "Qwen3VLImageProcessor" in image_processor_name:
+                        min_pixels = os.environ.get("QWEN3_VL_MIN_PIXELS") or os.environ.get("QWEN2_VL_MIN_PIXELS")
+                        max_pixels = os.environ.get("QWEN3_VL_MAX_PIXELS") or os.environ.get("QWEN2_VL_MAX_PIXELS")
+                        proc_kwargs = {
+                            "min_pixels": int(min_pixels) if min_pixels is not None else 3136,
+                            "max_pixels": int(max_pixels) if max_pixels is not None else 50176,
+                        }
+
+                    inputs = processor(text=[raw_prompt], images=images, videos=videos, **proc_kwargs)
+                    return len(inputs["input_ids"][0])
 
             else:
                 def doc2len(doc) -> int:
-                    return len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True))
+                    raw_prompt = tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True, tokenize=False)
+                    return len(tokenizer.encode(raw_prompt, add_special_tokens=False))
 
             # 所有prompt的长度统计信息
             print("计算prompt长度统计信息...")
@@ -173,11 +231,18 @@ class RLHFDataset(Dataset):
                 prompt_lengths.append(length)
             print(f"Prompt长度统计: 最大值: {max(prompt_lengths)}, 最小值: {min(prompt_lengths)}, 平均值: {sum(prompt_lengths) / len(prompt_lengths):.2f}")
    
-            dataframe = dataframe.filter(
-                lambda doc: doc2len(doc) <= self.max_prompt_length,
-                num_proc=self.num_workers,
-                desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
-            )
+            filter_fn = lambda doc: doc2len(doc) <= self.max_prompt_length
+            if self.num_workers <= 1:
+                dataframe = dataframe.filter(
+                    filter_fn,
+                    desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+                )
+            else:
+                dataframe = dataframe.filter(
+                    filter_fn,
+                    num_proc=self.num_workers,
+                    desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+                )
 
             print(f"filter dataset len: {len(dataframe)}")
         return dataframe
@@ -245,7 +310,19 @@ class RLHFDataset(Dataset):
                 # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205
                 multi_modal_data["video"] = [video.numpy() for video in videos]
 
-            model_inputs = self.processor(text=[raw_prompt], images=images, videos=videos, return_tensors="pt")
+            # Force pixel limits for Qwen2/3-VL to match the environment variables
+            # This ensures that even high-res images on disk are downsampled during loading
+            proc_kwargs = {}
+            image_processor_name = self.processor.image_processor.__class__.__name__
+            if "Qwen2VLImageProcessor" in image_processor_name or "Qwen3VLImageProcessor" in image_processor_name:
+                min_pixels = os.environ.get("QWEN3_VL_MIN_PIXELS") or os.environ.get("QWEN2_VL_MIN_PIXELS")
+                max_pixels = os.environ.get("QWEN3_VL_MAX_PIXELS") or os.environ.get("QWEN2_VL_MAX_PIXELS")
+                proc_kwargs = {
+                    "min_pixels": int(min_pixels) if min_pixels is not None else 3136,
+                    "max_pixels": int(max_pixels) if max_pixels is not None else 50176,
+                }
+
+            model_inputs = self.processor(text=[raw_prompt], images=images, videos=videos, return_tensors="pt", **proc_kwargs)
 
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
