@@ -117,6 +117,7 @@ ENV/
 
 # data
 *.parquet
+data/
 
 
 # local logs
@@ -124,3 +125,12 @@ logs
 log
 outputs
 .history
+
+# Training logs and datasets
+*.out
+*.err
+tensorboard_log
+tensorboard_result
+datasets
+our_datasets
+models
