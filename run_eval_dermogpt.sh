@@ -30,11 +30,15 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
-# Use the env that has verl + ray + vllm installed.
-PYTHON_BIN="/scratch2/ub62/ssim0070/conda/envs/verl/bin/python3"
+# Resolve repo root (directory containing this script).
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Use an env that has verl + ray + vllm installed.
+# Override with: SSL4RL_PYTHON_BIN=/path/to/python
+PYTHON_BIN="${SSL4RL_PYTHON_BIN:-python3}"
 
 # Ensure `import verl` resolves to this repo checkout.
-export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/SSL4RL"
+export PYTHONPATH="${PYTHONPATH:-}:${REPO_ROOT}"
 
 # Ray tends to be sensitive on shared filesystems; keep its temp on local /tmp and
 # increase startup timeouts (we've already seen "node timed out during startup").
