@@ -85,7 +85,12 @@ class HFRollout(BaseRollout):
                 "top_p": top_p,
                 "top_k": top_k,
                 "temperature": temperature,
-                "num_return_sequences": self.config.n,
+                # IMPORTANT:
+                # RayTrainer repeats `gen_batch` by `rollout.n` *before* calling generate_sequences()
+                # (see `ray_trainer.py`), so at this point each prompt should produce exactly one
+                # response. If we also set `num_return_sequences=self.config.n` here, we would
+                # effectively produce n*n responses and break downstream `batch.union(...)`.
+                "num_return_sequences": 1,
             }
 
         # make config according to generate mode
@@ -106,11 +111,15 @@ class HFRollout(BaseRollout):
         if isinstance(self.module, FSDP):
             # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
+        model_position_ids = position_ids
+        if position_ids.dim() == 3:
+            model_position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
+
         with param_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             output = self.module.generate(
                 input_ids=idx,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                position_ids=model_position_ids,
                 do_sample=do_sample,
                 max_new_tokens=response_length,
                 eos_token_id=eos_token_id,
@@ -149,7 +158,11 @@ class HFRollout(BaseRollout):
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
         delta_position_id = delta_position_id.unsqueeze(0).repeat(generated_batch_size, 1)
 
-        response_position_ids = position_ids[:, -1:] + delta_position_id
+        if position_ids.dim() == 3:
+            response_position_ids = position_ids[..., -1:] + delta_position_id.unsqueeze(1)
+        else:
+            response_position_ids = position_ids[:, -1:] + delta_position_id
+
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
 
         response_attention_mask = get_response_mask(

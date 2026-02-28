@@ -621,7 +621,11 @@ def patch_valuehead_model(model) -> None:
 
 
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
-    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
+    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification
+    try:
+        from transformers import AutoModelForVision2Seq  # type: ignore
+    except Exception:
+        AutoModelForVision2Seq = None  # type: ignore[assignment]
 
     try:
         model = AutoModelForTokenClassification.from_pretrained(
@@ -642,9 +646,20 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
 
     from trl import AutoModelForCausalLMWithValueHead
 
-    if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
+    module_class = None
+    model_type = getattr(model_config, "model_type", None)
+    if model_type == "qwen3_vl":
+        from transformers import Qwen3VLForConditionalGeneration
+
+        module_class = Qwen3VLForConditionalGeneration
+    elif model_type == "qwen2_vl":
+        from transformers import Qwen2VLForConditionalGeneration
+
+        module_class = Qwen2VLForConditionalGeneration
+    elif AutoModelForVision2Seq is not None and type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
         module_class = AutoModelForVision2Seq
-    else:
+
+    if module_class is None:
         module_class = AutoModelForCausalLM
     ori_model = module_class.from_pretrained(
         pretrained_model_name_or_path=local_path,

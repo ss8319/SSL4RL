@@ -312,9 +312,25 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
                     auto_model_cls = AutoModelForCausalLM
                 elif "ForConditionalGeneration" in model_config.architectures[0]:
-                    from transformers import AutoModelForVision2Seq
+                    model_type = getattr(model_config, "model_type", None)
+                    if model_type == "qwen3_vl":
+                        from transformers import Qwen3VLForConditionalGeneration
 
-                    auto_model_cls = AutoModelForVision2Seq
+                        auto_model_cls = Qwen3VLForConditionalGeneration
+                    elif model_type == "qwen2_vl":
+                        from transformers import Qwen2VLForConditionalGeneration
+
+                        auto_model_cls = Qwen2VLForConditionalGeneration
+                    else:
+                        try:
+                            from transformers import AutoModelForVision2Seq  # type: ignore
+
+                            auto_model_cls = AutoModelForVision2Seq
+                        except Exception as e:
+                            raise ImportError(
+                                "AutoModelForVision2Seq is not available in this Transformers build, "
+                                f"and no dedicated conditional-generation class was selected for model_type={model_type!r}."
+                            ) from e
                 else:
                     raise NotImplementedError(f"Unknown architecture {model_config['architectures']}")
 

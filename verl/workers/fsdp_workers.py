@@ -222,7 +222,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+
+        from transformers import AutoConfig, AutoModelForCausalLM
+        from transformers.utils import is_torch_available
+
+        # NOTE: `AutoModelForVision2Seq` is not present in some Transformers builds (including our
+        # transformers==5.2.0 env). For Qwen2/3-VL we should use the dedicated model classes instead.
+        try:
+            from transformers import AutoModelForVision2Seq  # type: ignore
+        except Exception:
+            AutoModelForVision2Seq = None  # type: ignore[assignment]
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -277,9 +286,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
-                actor_module_class = AutoModelForVision2Seq
-            else:
+            actor_module_class = None
+            model_type = getattr(actor_model_config, "model_type", None)
+
+            # Prefer dedicated VLM classes when available.
+            if model_type == "qwen3_vl":
+                from transformers import Qwen3VLForConditionalGeneration
+
+                actor_module_class = Qwen3VLForConditionalGeneration
+            elif model_type == "qwen2_vl":
+                from transformers import Qwen2VLForConditionalGeneration
+
+                actor_module_class = Qwen2VLForConditionalGeneration
+            elif AutoModelForVision2Seq is not None:
+                # Generic vision-to-seq auto class (if available in this Transformers build).
+                if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+                    actor_module_class = AutoModelForVision2Seq
+
+            if actor_module_class is None:
                 actor_module_class = AutoModelForCausalLM
 
             actor_module = actor_module_class.from_pretrained(

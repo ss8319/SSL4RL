@@ -6,14 +6,15 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:A100:2
 #SBATCH --constraint=A100-80G
-#SBATCH --mem=256G
+#SBATCH --mem=768G
 #SBATCH --cpus-per-task=32
 #SBATCH --time=24:00:00
 #SBATCH --partition=fit
 #SBATCH --account=ub62
 #SBATCH --qos=fitq
 
-# Usage: bash run_dermogpt_task.sh [contrastive|jigsaw|position|rotation] [model_path]
+# Usage: bash run_dermogpt_task.sh [TASK] [MODEL_PATH] [DATA_LIMIT]
+# Example: sbatch run_dermogpt_task.sh rotation Qwen/Qwen3-VL-2B-Instruct 0.5
 
 # Load environment variables (e.g., WANDB_API_KEY)
 if [[ -f ".env" ]]; then
@@ -22,7 +23,8 @@ if [[ -f ".env" ]]; then
 fi
 
 TASK=$1
-MODEL_PATH=${2:-"Qwen/Qwen3-VL-4B-Instruct"}
+MODEL_PATH=${2:-"Qwen/Qwen3-VL-2B-Instruct"}
+DATA_LIMIT=${3:-$SSL4RL_DATA_LIMIT}
 
 if [[ -z "$TASK" ]]; then
     echo "Error: TASK argument is required (contrastive, jigsaw, position, or rotation)"
@@ -76,6 +78,52 @@ fi
 train_files="['$train_path']"
 val_files="['$valid_path','$test_path']"
 
+# Data subsetting logic (fraction or absolute number)
+if [[ -n "$DATA_LIMIT" ]]; then
+    # Validate input: must be a positive number or decimal
+    if ! [[ "$DATA_LIMIT" =~ ^[0-9.]+$ ]]; then
+        echo "ERROR: DATA_LIMIT must be a number (e.g. 0.5 or 4000). Got: '$DATA_LIMIT'"
+        exit 1
+    fi
+
+    subset_train_path="${DATASET_DIR}/train_subset_${DATA_LIMIT//./_}_${RUN_ID}.parquet"
+    # Set trap early to ensure cleanup even if Python fails
+    trap 'rm -f "${subset_train_path}"' EXIT
+
+    echo "Subsetting training data with limit: ${DATA_LIMIT} -> ${subset_train_path}"
+    python3 -c "
+import pandas as pd
+import os
+import sys
+
+try:
+    df = pd.read_parquet('${train_path}')
+    limit = float('${DATA_LIMIT}')
+    
+    if limit <= 0:
+        print(f'Invalid data limit: {limit}. Using full dataset.')
+        sys.exit(0)
+    
+    # Logic: 
+    # - If 0 < limit < 1.0 (excluding exactly 1.0), treat as fraction.
+    # - If limit >= 1.0, treat as absolute sample count.
+    if 0 < limit < 1.0:
+        n = int(len(df) * limit)
+    else:
+        n = int(limit)
+    
+    n = max(1, min(n, len(df)))
+    print(f'Subsetting dataset from {len(df)} to {n} samples')
+    df.iloc[:n].to_parquet('${subset_train_path}')
+except Exception as e:
+    print(f'CRITICAL: Error subsetting dataset: {e}')
+    sys.exit(1)
+" || exit 1
+    
+    train_path="${subset_train_path}"
+    train_files="['$train_path']"
+fi
+
 # If the dataset is very small (e.g., jigsaw_small has only a couple rows),
 # the default batch sizes can make the train dataloader empty because the
 # trainer uses drop_last=True.
@@ -85,27 +133,10 @@ ds = datasets.load_dataset("parquet", data_files="${train_path}")["train"]
 print(len(ds))
 PY
 )"
-if [[ "${TRAIN_DATA_LEN}" =~ ^[0-9]+$ ]] && (( TRAIN_DATA_LEN > 0 )); then
-  TRAIN_BATCH_SIZE="${SSL4RL_TRAIN_BATCH_SIZE:-16}"
-  if (( TRAIN_BATCH_SIZE > TRAIN_DATA_LEN )); then
-    TRAIN_BATCH_SIZE="$TRAIN_DATA_LEN"
-  fi
-else
-  TRAIN_DATA_LEN="0"
-  TRAIN_BATCH_SIZE="${SSL4RL_TRAIN_BATCH_SIZE:-16}"
+# Ensure TRAIN_DATA_LEN is a valid number
+if ! [[ "${TRAIN_DATA_LEN}" =~ ^[0-9]+$ ]]; then
+  TRAIN_DATA_LEN=0
 fi
-
-# Keep PPO batch sizes consistent with train batch size.
-PPO_MINI_BATCH_SIZE="${SSL4RL_PPO_MINI_BATCH_SIZE:-$TRAIN_BATCH_SIZE}"
-PPO_MICRO_BSZ_PER_GPU="${SSL4RL_PPO_MICRO_BSZ_PER_GPU:-2}"
-if (( PPO_MINI_BATCH_SIZE < 4 )); then
-  PPO_MICRO_BSZ_PER_GPU=1
-fi
-
-echo "TRAIN_DATA_LEN: ${TRAIN_DATA_LEN}"
-echo "TRAIN_BATCH_SIZE: ${TRAIN_BATCH_SIZE}"
-echo "PPO_MINI_BATCH_SIZE: ${PPO_MINI_BATCH_SIZE}"
-echo "PPO_MICRO_BSZ_PER_GPU: ${PPO_MICRO_BSZ_PER_GPU}"
 
 # Ensure directories exist
 mkdir -p models
@@ -143,6 +174,9 @@ export RAY_FILE_SYSTEM_MONITOR_WARN_THRESHOLD_FRACTION="${RAY_file_system_monito
 # Helpful for tokenizer forks + less log noise.
 export TOKENIZERS_PARALLELISM=false
 
+# Helps reduce CUDA allocator fragmentation (often shows up as "reserved but unallocated").
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 # Optional: helps avoid HF Hub rate-limit stalls.
 if [[ -z "${HF_TOKEN:-}" ]]; then
   echo "WARNING: HF_TOKEN is not set (HF Hub downloads may be rate-limited / stall)."
@@ -153,13 +187,83 @@ export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 # Let Slurm/Ray handle CUDA_VISIBLE_DEVICES
 
-# Limit image resolution to speed up tokenization and reduce memory usage
-# 50176 pixels is exactly 224x224. 1 patch is 14x14 = 196 pixels.
-# 50176 / 196 = 256 tokens per image. 4 images = 1024 tokens.
-export QWEN2_VL_MIN_PIXELS=3136
-export QWEN2_VL_MAX_PIXELS=50176
-export QWEN3_VL_MIN_PIXELS=3136
-export QWEN3_VL_MAX_PIXELS=50176
+# --- Pixel resolution and Task-specific limits ---
+# Qwen3-VL visual tokens = Pixels / 196.
+# 50176 pixels = 256 tokens per image.
+if [[ "$TASK" == "jigsaw"* ]]; then
+    # Setup for 4 images (~1024 visual tokens)
+    export QWEN3_VL_MAX_PIXELS="${QWEN3_VL_MAX_PIXELS:-50176}"
+    MAX_PROMPT_LEN=2048
+    DEFAULT_PPO_MICRO_BSZ=2
+    DEFAULT_ROLLOUT_MICRO_BSZ=1
+else
+    # Setup for 2 images (~512 visual tokens)
+    export QWEN3_VL_MAX_PIXELS="${QWEN3_VL_MAX_PIXELS:-50176}"
+    MAX_PROMPT_LEN=1024
+    DEFAULT_PPO_MICRO_BSZ=4
+    DEFAULT_ROLLOUT_MICRO_BSZ=2
+fi
+export QWEN3_VL_MIN_PIXELS="${QWEN3_VL_MIN_PIXELS:-3136}"
+export QWEN2_VL_MIN_PIXELS="${QWEN2_VL_MIN_PIXELS:-$QWEN3_VL_MIN_PIXELS}"
+export QWEN2_VL_MAX_PIXELS="${QWEN2_VL_MAX_PIXELS:-$QWEN3_VL_MAX_PIXELS}"
+
+# Cap validation batch size to avoid OOM during initial validation (default behavior may batch the entire val set).
+VAL_BATCH_SIZE="${SSL4RL_VAL_BATCH_SIZE:-8}"
+
+# HF rollout can OOM if it tries to generate for a huge batch at once. Chunk generation explicitly.
+# (HFRollout uses `actor_rollout_ref.rollout.micro_batch_size` to split the generation batch.)
+ROLLOUT_MICRO_BSZ="${SSL4RL_ROLLOUT_MICRO_BSZ:-$DEFAULT_ROLLOUT_MICRO_BSZ}"
+
+# For these tasks, outputs are typically short; reducing response length saves a lot of KV-cache memory.
+MAX_RESPONSE_LEN="${SSL4RL_MAX_RESPONSE_LEN:-128}"
+
+# Speed optimization: Skip the expensive pre-training validation pass.
+VAL_BEFORE_TRAIN="${SSL4RL_VAL_BEFORE_TRAIN:-False}"
+
+# --- Batch Size Robustness Logic ---
+# 1. Base Train Batch Size
+TRAIN_BATCH_SIZE="${SSL4RL_TRAIN_BATCH_SIZE:-64}"
+if (( TRAIN_BATCH_SIZE > TRAIN_DATA_LEN )); then
+  TRAIN_BATCH_SIZE="$TRAIN_DATA_LEN"
+fi
+
+# 2. PPO Mini Batch Size
+# Recommendation: 32 for stable GRPO on 2x A100. Fallback to TRAIN_BATCH_SIZE if dataset is tiny.
+DEFAULT_MINI_BSZ=32
+if (( TRAIN_BATCH_SIZE < DEFAULT_MINI_BSZ )); then
+    DEFAULT_MINI_BSZ="$TRAIN_BATCH_SIZE"
+fi
+PPO_MINI_BATCH_SIZE="${SSL4RL_PPO_MINI_BATCH_SIZE:-$DEFAULT_MINI_BSZ}"
+
+# 3. PPO Micro Batch Size (must divide the normalized batch size)
+# Math: Normalized_BSZ = (PPO_MINI_BATCH_SIZE * rollout_n) / n_gpus_per_node
+# Current n=5, gpus=2. So Normalized_BSZ = (PPO_MINI_BATCH_SIZE * 5) / 2
+ROLLOUT_N=5
+GPUS_PER_NODE=2
+NORMALIZED_BSZ=$(( (PPO_MINI_BATCH_SIZE * ROLLOUT_N) / GPUS_PER_NODE ))
+
+PPO_MICRO_BSZ_PER_GPU="${SSL4RL_PPO_MICRO_BSZ_PER_GPU:-$DEFAULT_PPO_MICRO_BSZ}"
+
+# Fallback: If normalized batch size is not divisible by micro batch size, force it to 1
+if (( NORMALIZED_BSZ % PPO_MICRO_BSZ_PER_GPU != 0 )); then
+  echo "WARNING: Normalized PPO batch size (${NORMALIZED_BSZ}) is not divisible by micro batch size (${PPO_MICRO_BSZ_PER_GPU})."
+  echo "         Forcing PPO_MICRO_BSZ_PER_GPU to 1 for robustness."
+  PPO_MICRO_BSZ_PER_GPU=1
+fi
+
+export TRAIN_BATCH_SIZE PPO_MINI_BATCH_SIZE SSL4RL_PPO_MICRO_BSZ_PER_GPU="${PPO_MICRO_BSZ_PER_GPU}"
+
+echo "Task-specific optimization for: $TASK"
+echo "  Max Pixels: $QWEN3_VL_MAX_PIXELS"
+echo "  Max Prompt Len: $MAX_PROMPT_LEN"
+echo "  Max Response Len: $MAX_RESPONSE_LEN"
+echo "  Train Batch Size: ${TRAIN_BATCH_SIZE}"
+echo "  PPO Mini Batch Size: ${PPO_MINI_BATCH_SIZE}"
+echo "  PPO Micro Batch Size (per GPU): ${PPO_MICRO_BSZ_PER_GPU}"
+echo "  Val Batch Size: ${VAL_BATCH_SIZE}"
+echo "  Rollout Micro Batch Size: ${ROLLOUT_MICRO_BSZ}"
+echo "  Val Before Train: ${VAL_BEFORE_TRAIN}"
+
 python3 -c "import torch; print('CUDA count:', torch.cuda.device_count()); t = torch.randn(1, device='cuda'); print('CUDA tensor creation success!')" || echo "WARNING: Minimal CUDA check failed!"
 
 echo "Starting RL training for DermoGPT TASK: $TASK"
@@ -174,10 +278,11 @@ python3 -m verl.trainer.main_ppo \
     data.train_files="$train_files" \
     data.val_files="$val_files" \
     data.train_batch_size="${TRAIN_BATCH_SIZE}" \
-    data.max_prompt_length=16384 \
-    data.max_response_length=2048 \
+    data.val_batch_size="${VAL_BATCH_SIZE}" \
+    data.max_prompt_length="${MAX_PROMPT_LEN}" \
+    data.max_response_length="${MAX_RESPONSE_LEN}" \
     data.filter_overlong_prompts=True \
-    data.filter_overlong_prompts_workers=0 \
+    data.filter_overlong_prompts_workers=16 \
     data.truncation='right' \
     data.image_key=images \
     data.dataloader_num_workers=0 \
@@ -204,6 +309,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name="${ROLLOUT_BACKEND}" \
     actor_rollout_ref.rollout.top_k="${ROLLOUT_TOP_K}" \
+    +actor_rollout_ref.rollout.micro_batch_size="${ROLLOUT_MICRO_BSZ}" \
     actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=True \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
@@ -221,6 +327,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=50 \
     trainer.test_freq=200 \
+    trainer.val_before_train="${VAL_BEFORE_TRAIN}" \
     trainer.default_local_dir="${SAVE_DIR}" \
     trainer.total_epochs=20 \
     critic.model.path="$MODEL_PATH" \

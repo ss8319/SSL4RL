@@ -75,6 +75,10 @@ video_key: videos
 # If the remote tokenizer has a Python file, this flag determines whether to allow using it.
 trust_remote_code: False
 
+# Whether to require a processor for multimodal datasets.
+# If True, the trainer will raise an error if the dataset contains images/videos but no processor is provided.
+require_processor_for_multimodal: True
+
 # Optional: specify a custom dataset class path and name if overriding default loading behavior.
 custom_cls:
 
